@@ -1,17 +1,19 @@
 /**
  * Vercel Serverless & Local HTTP Entrypoint for the A2A Private Chain (chain/api.js)
  *
- * Simplified & Persistent Design (Method B - PC Hard-Drive Anchor Sync):
- *   1. On every read/write, syncs with the Anchor Host's hard drive (`/chain-anchor/ledger`)
- *      so even if Vercel Serverless instances recycle `/tmp`, registered AIDs are restored automatically!
- *   2. Zero-Friction Registration & Temporary Tunnel Update (`POST /chain/register`):
- *      - New Agent -> Auto-assigned sequential AID (2, 3, 4...).
- *      - Existing Agent (e.g. Muse passing `{ aid: "2", httpsEndpoint: "https://new-temp-url" }`
- *        or `{ agentName: "muse", httpsEndpoint: "https://new-temp-url" }`) -> Directly updates
- *        that AID's `httpsEndpoint` in-place without requiring any password or secret key!
+ * Security & Persistence Design:
+ *   1. Authenticated Method B Persistence (`ANCHOR_HOST_URL` + `ANCHOR_SECRET` in Vercel Env):
+ *      - Pulls/pushes ledger snapshots from/to the Anchor Host PC hard drive using `X-Anchor-Secret`.
+ *   2. Ownership-Protected Sequential Registration (`POST /chain/register`):
+ *      - New Agent -> Auto-assigned sequential AID (`2, 3, 4...`) + issued one-time `ownerSecret`.
+ *      - Updating existing AID (`aid` or same `agentName`) -> Requires valid `X-Aid-Owner-Secret`
+ *        (automatically stored & sent by `server/host_cli.js`) OR Admin `X-Chain-Admin-Key`.
+ *      - Genesis `AID = "1"` -> STRICTLY requires `X-Chain-Admin-Key` matching `process.env.CHAIN_ADMIN_KEY`
+ *        (NEVER reads privilege flags from request body!).
  */
 
 const {
+  safeEqual,
   syncLedgerFromAnchorHost,
   pushLedgerToAnchorHost,
   verifyChainIntegrity,
@@ -25,7 +27,7 @@ function sendJson(res, statusCode, payload) {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Access-Control-Allow-Headers': 'Content-Type, X-Chain-Admin-Key, X-Aid-Owner-Secret'
   });
   res.end(body);
 }
@@ -58,7 +60,7 @@ module.exports = async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
   const pathname = url.searchParams.get('__path') || url.pathname;
 
-  // Method B: Always pull/merge the latest ledger from the Anchor Host PC hard drive first!
+  // Method B: Pull/merge the latest ledger from the authenticated Anchor Host PC hard drive first
   const ledger = await syncLedgerFromAnchorHost();
   const integrity = verifyChainIntegrity(ledger);
 
@@ -76,7 +78,7 @@ module.exports = async function handler(req, res) {
       records: ledger.stateRecords,
       endpoints: {
         registerOrUpdateAID:
-          'POST /chain/register (Body: { aid?, agentName, httpsEndpoint, tags?, description? }) -> 新用户自动按序分配 AID (2,3..)，老用户传 aid 或同名 agentName 直接原地更新临时隧道地址',
+          'POST /chain/register -> 新用户自动按序分配 AID (2,3..) 并颁发 ownerSecret；更新已有 AID 需携带 X-Aid-Owner-Secret 请求头；修改 AID=1 需 X-Chain-Admin-Key',
         resolveAID: 'GET /chain/resolve?aid=1',
         searchByClue: 'GET /chain/search?query=关键词',
         viewBlocks: 'GET /chain/blocks',
@@ -140,13 +142,20 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  // 6. Register New Sequential AID (2, 3, 4...) OR In-Place Update of Temporary Tunnel URL
+  // 6. Register New Sequential AID (2, 3, 4...) OR Authenticated In-Place Update
   if (req.method === 'POST' && (pathname === '/chain/register' || pathname === '/chain/update' || pathname === '/chain/admin/commit')) {
     try {
       const body = await readJsonBody(req);
       if (!body.httpsEndpoint) {
         return sendJson(res, 400, { ok: false, error: 'httpsEndpoint is required' });
       }
+
+      // Server-side Admin verification strictly from Vercel Environment Variable (ZERO hardcoded fallback!)
+      const configuredAdminKey = process.env.CHAIN_ADMIN_KEY || null;
+      const providedAdminKey = req.headers['x-chain-admin-key'] || '';
+      const isAdmin = Boolean(configuredAdminKey && providedAdminKey && safeEqual(providedAdminKey, configuredAdminKey));
+
+      const providedOwnerSecret = req.headers['x-aid-owner-secret'] || body.ownerSecret || '';
 
       const result = registerOrUpdateAIDOnLedger(ledger, {
         aid: body.aid,
@@ -156,7 +165,8 @@ module.exports = async function handler(req, res) {
         tags: body.tags,
         description: body.description,
         mailboxAddress: body.mailboxAddress,
-        allowUpdateAid1: Boolean(body.allowUpdateAid1)
+        providedOwnerSecret,
+        isAdmin
       });
 
       // Method B: Immediately push the updated ledger back to the Anchor Host PC hard drive!
@@ -167,12 +177,13 @@ module.exports = async function handler(req, res) {
         mode: result.isUpdate ? 'AID_ENDPOINT_UPDATED' : 'SEQUENTIAL_AID_MINTED',
         persistedToAnchorHost: persistedToAnchor,
         message: result.isUpdate
-          ? `AID = ${result.assignedAid} 的 HTTPS 地址已原地更新为最新隧道地址 (Block #${result.block.blockNumber})，并同步写入主节点硬盘！`
-          : `新 AID 注册成功！系统按顺序自动分配 AID = ${result.assignedAid} (Block #${result.block.blockNumber})，并同步写入主节点硬盘！`,
+          ? `AID = ${result.assignedAid} 的 HTTPS 地址已通过所有权校验并原地更新 (Block #${result.block.blockNumber})`
+          : `新 AID 注册成功！系统按顺序自动分配 AID = ${result.assignedAid} (Block #${result.block.blockNumber})，请妥善保存本次返回的 ownerSecret 用于后续更新临时隧道地址`,
         ...result
       });
     } catch (err) {
-      const status = err.code === 'GENESIS_AID_PROTECTED' ? 403 : 500;
+      const forbiddenCodes = new Set(['GENESIS_AID_PROTECTED', 'CHAIN_AID_OWNERSHIP_PROTECTED', 'INVALID_ARBITRARY_AID']);
+      const status = forbiddenCodes.has(err.code) ? 403 : 500;
       return sendJson(res, status, {
         ok: false,
         errorCode: err.code || 'CHAIN_REGISTER_ERROR',

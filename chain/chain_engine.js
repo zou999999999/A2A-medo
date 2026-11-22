@@ -1,17 +1,17 @@
 /**
- * Simplified Private Chain Engine with Host Hard-Drive Anchor Persistence (chain/chain_engine.js)
+ * Private Chain Engine with Authenticated Host Hard-Drive Anchor Persistence (chain/chain_engine.js)
  *
- * Implements:
+ * Security & Governance Model:
  *   1. Sequential Auto-Increment AID Minting (1 -> 2 -> 3 -> 4...):
- *      - New users registering for the first time automatically get the next integer AID.
- *   2. Zero-Friction In-Place Tunnel Update for Temporary Tunnels:
- *      - When an existing Agent restarts its temporary tunnel and sends `{ aid, httpsEndpoint }`
- *        or `{ agentName, httpsEndpoint }`, the chain directly updates that existing AID's
- *        `httpsEndpoint` in-place (appending a new block) without requiring any secret key ceremony.
- *   3. Method B Persistence (Sync with Anchor Host Hard Drive):
- *      - Every update on Vercel automatically syncs to the Anchor Host's local hard drive (`server/data/chain_ledger.json`).
- *      - Whenever a Vercel Serverless instance cold-starts or wakes up, it automatically pulls
- *        the latest ledger back from the Anchor Host's hard drive so registered AIDs are never lost.
+ *      - New users registering for the first time automatically get the next integer AID,
+ *        receive a unique one-time `ownerSecret` (only its SHA-256 `ownerKeyHash` is stored on-chain).
+ *   2. Protected In-Place Tunnel Updates:
+ *      - Genesis `AID = "1"` can ONLY be updated with valid `X-Chain-Admin-Key` (Vercel env `CHAIN_ADMIN_KEY`).
+ *      - Any existing AID (`2, 3, ...`) can ONLY be updated by providing its matching `X-Aid-Owner-Secret`
+ *        (automatically saved & sent by `server/host_cli.js`) OR `X-Chain-Admin-Key`.
+ *   3. Authenticated Method B Persistence (Sync with Anchor Host Hard Drive):
+ *      - Configured strictly via Vercel env vars `ANCHOR_HOST_URL` and `ANCHOR_SECRET`.
+ *      - All `/chain-anchor/ledger` requests authenticate via `X-Anchor-Secret`.
  */
 
 const fs = require('node:fs');
@@ -19,17 +19,28 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 
-const LOCAL_ANCHOR_LEDGER_FILE = path.resolve(__dirname, '..', 'server', 'data', 'chain_ledger.json');
+const LOCAL_ANCHOR_LEDGER_FILE = process.env.LOCAL_CHAIN_LEDGER_FILE
+  ? path.resolve(process.env.LOCAL_CHAIN_LEDGER_FILE)
+  : path.resolve(__dirname, '..', 'server', 'data', 'chain_ledger.json');
 const TMP_LEDGER_FILE = path.join(os.tmpdir(), 'a2a_poa_private_chain_ledger.json');
 
-// Anchor Host URL is configured strictly via Vercel Environment Variable `ANCHOR_HOST_URL`
-// so zero host tunnel URLs ever appear in GitHub source files!
-const ANCHOR_HOST_URL = process.env.ANCHOR_HOST_URL
-  ? process.env.ANCHOR_HOST_URL.replace(/\/+$/, '')
-  : null;
+function getAnchorHostUrl() {
+  return process.env.ANCHOR_HOST_URL ? process.env.ANCHOR_HOST_URL.replace(/\/+$/, '') : null;
+}
+
+function getAnchorSecret() {
+  return process.env.ANCHOR_SECRET || '';
+}
 
 function sha256Hex(input) {
   return '0x' + crypto.createHash('sha256').update(String(input)).digest('hex');
+}
+
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a || ''), 'utf8');
+  const bufB = Buffer.from(String(b || ''), 'utf8');
+  if (bufA.length === 0 || bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 function computeBlockHash({ blockNumber, prevBlockHash, timestamp, txHash, action, payload }) {
@@ -49,7 +60,7 @@ function createEmptyLedger() {
   return {
     chainId: 'a2a-private-chain-v1',
     chainName: 'A2A Sequential-AID Private Chain',
-    consensus: 'Append-Only SHA-256 Hash Chain (Sequential AID + PC Hard-Drive Anchor Sync)',
+    consensus: 'Append-Only SHA-256 Hash Chain (Sequential AID + OwnerSecret/Admin Guard + Authenticated Anchor Sync)',
     createdAt: genesisTimestamp,
     nextAidNumber: 1,
     blockHeight: 0,
@@ -64,7 +75,9 @@ function saveLedger(ledger) {
   let savedToLocalAnchor = false;
   try {
     if (fs.existsSync(path.dirname(LOCAL_ANCHOR_LEDGER_FILE))) {
-      fs.writeFileSync(LOCAL_ANCHOR_LEDGER_FILE, serialized, 'utf-8');
+      const tmp = `${LOCAL_ANCHOR_LEDGER_FILE}.tmp.${process.pid}.${Date.now()}`;
+      fs.writeFileSync(tmp, serialized, 'utf-8');
+      fs.renameSync(tmp, LOCAL_ANCHOR_LEDGER_FILE);
       savedToLocalAnchor = true;
     }
   } catch {
@@ -129,75 +142,13 @@ function loadLedger() {
 }
 
 /**
- * Method B: Pull latest ledger from the Anchor Host PC's hard drive (`GET /chain-anchor/ledger`)
- */
-async function syncLedgerFromAnchorHost() {
-  const localLedger = loadLedger();
-  if (process.env.IS_LOCAL_ANCHOR_HOST === 'true' || !ANCHOR_HOST_URL) {
-    return localLedger;
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 2500);
-  try {
-    const resp = await fetch(`${ANCHOR_HOST_URL}/chain-anchor/ledger`, {
-      method: 'GET',
-      headers: {
-        'ngrok-skip-browser-warning': 'true',
-        'bypass-tunnel-reminder': 'true'
-      },
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data && data.ledger && data.ledger.blocks && data.ledger.stateRecords) {
-        const merged = pickNewerLedger(localLedger, data.ledger);
-        saveLedger(merged);
-        return merged;
-      }
-    }
-  } catch {
-    clearTimeout(timer);
-  }
-  return localLedger;
-}
-
-/**
- * Method B: Push updated ledger back to the Anchor Host PC's hard drive (`POST /chain-anchor/ledger`)
- */
-async function pushLedgerToAnchorHost(ledger) {
-  saveLedger(ledger);
-  if (process.env.IS_LOCAL_ANCHOR_HOST === 'true' || !ANCHOR_HOST_URL) {
-    return false;
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3000);
-  try {
-    const resp = await fetch(`${ANCHOR_HOST_URL}/chain-anchor/ledger`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true',
-        'bypass-tunnel-reminder': 'true'
-      },
-      body: JSON.stringify({ ledger }),
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    return resp.ok;
-  } catch {
-    clearTimeout(timer);
-    return false;
-  }
-}
-
-/**
- * Cryptographically verify the SHA-256 hash chain
+ * Cryptographically verify the SHA-256 hash chain from Genesis Block #0 to latest block
  */
 function verifyChainIntegrity(ledger = loadLedger()) {
-  const blocks = ledger.blocks || [];
+  const blocks = ledger && Array.isArray(ledger.blocks) ? ledger.blocks : null;
+  if (!blocks) {
+    return { valid: false, reason: 'Invalid ledger: missing blocks array' };
+  }
   if (blocks.length === 0) {
     return { valid: true, verifiedBlocks: 0, nextSequentialAid: '1' };
   }
@@ -240,7 +191,93 @@ function verifyChainIntegrity(ledger = loadLedger()) {
 }
 
 /**
- * Register a New Sequential AID (1 -> 2 -> 3...) OR Update an Existing AID's Temporary Tunnel URL
+ * Method B: Pull latest ledger from the Anchor Host PC's hard drive (`GET /chain-anchor/ledger`)
+ * Authenticated via `X-Anchor-Secret`.
+ */
+async function syncLedgerFromAnchorHost() {
+  const localLedger = loadLedger();
+  const anchorUrl = getAnchorHostUrl();
+  const anchorSecret = getAnchorSecret();
+  if (process.env.IS_LOCAL_ANCHOR_HOST === 'true' || !anchorUrl) {
+    return localLedger;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  try {
+    const headers = {
+      'ngrok-skip-browser-warning': 'true',
+      'bypass-tunnel-reminder': 'true'
+    };
+    if (anchorSecret) headers['x-anchor-secret'] = anchorSecret;
+
+    const resp = await fetch(`${anchorUrl}/chain-anchor/ledger`, {
+      method: 'GET',
+      headers,
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && data.ledger && verifyChainIntegrity(data.ledger).valid) {
+        const merged = pickNewerLedger(localLedger, data.ledger);
+        saveLedger(merged);
+        return merged;
+      }
+    }
+  } catch {
+    clearTimeout(timer);
+  }
+  return localLedger;
+}
+
+/**
+ * Method B: Push updated ledger back to the Anchor Host PC's hard drive (`POST /chain-anchor/ledger`)
+ * Authenticated via `X-Anchor-Secret`.
+ */
+async function pushLedgerToAnchorHost(ledger) {
+  saveLedger(ledger);
+  const anchorUrl = getAnchorHostUrl();
+  const anchorSecret = getAnchorSecret();
+  if (process.env.IS_LOCAL_ANCHOR_HOST === 'true' || !anchorUrl) {
+    return false;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const headers = {
+      'Content-Type': 'application/json',
+      'ngrok-skip-browser-warning': 'true',
+      'bypass-tunnel-reminder': 'true'
+    };
+    if (anchorSecret) headers['x-anchor-secret'] = anchorSecret;
+
+    const resp = await fetch(`${anchorUrl}/chain-anchor/ledger`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ledger }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    return resp.ok;
+  } catch {
+    clearTimeout(timer);
+    return false;
+  }
+}
+
+/**
+ * Register a New Sequential AID (1 -> 2 -> 3...) OR Update an Existing AID with Ownership/Admin Guard
+ *
+ * Governance Rules:
+ *   - New registration (no existing `aid` and no existing `agentName`):
+ *       Auto-assigns next sequential AID, generates a one-time `ownerSecret`,
+ *       stores ONLY `ownerKeyHash = sha256Hex(ownerSecret)` on-chain, and returns `ownerSecret` once.
+ *   - Updating Genesis `AID = "1"`:
+ *       Requires `isAdmin === true` (authenticated via `X-Chain-Admin-Key`).
+ *   - Updating ANY existing AID (`2, 3, ...`, whether by `aid` or matching `agentName`):
+ *       Requires `isAdmin === true` OR `sha256Hex(providedOwnerSecret) === existing.ownerKeyHash`.
  */
 function registerOrUpdateAIDOnLedger(
   ledger,
@@ -252,7 +289,8 @@ function registerOrUpdateAIDOnLedger(
     tags = null,
     description = '',
     mailboxAddress = null,
-    allowUpdateAid1 = false
+    providedOwnerSecret = '',
+    isAdmin = false
   }
 ) {
   if (!httpsEndpoint) {
@@ -261,6 +299,7 @@ function registerOrUpdateAIDOnLedger(
 
   let targetAid = aid !== null && aid !== undefined && String(aid).trim() !== '' ? String(aid).trim() : null;
 
+  // Check if agentName matches an existing record (e.g. Muse re-updating its temporary tunnel URL)
   if (!targetAid && agentName) {
     const cleanName = String(agentName).trim().toLowerCase();
     const matched = Object.values(ledger.stateRecords || {}).find(
@@ -271,19 +310,50 @@ function registerOrUpdateAIDOnLedger(
     }
   }
 
-  if (targetAid === '1' && ledger.stateRecords['1'] && !allowUpdateAid1) {
-    const err = new Error('AID 1 为创世主节点，外部节点请使用 AID 2 及后续号码进行注册或更新。');
+  const existing = targetAid ? ledger.stateRecords[targetAid] : null;
+
+  // 1. Strict Genesis AID = 1 Protection (Server-side `isAdmin` ONLY; never read from request body!)
+  if (targetAid === '1' && existing && !isAdmin) {
+    const err = new Error('权限拒绝：AID 1 为创世主节点，仅携带有效管理员凭证 (X-Chain-Admin-Key) 方可修改！');
     err.code = 'GENESIS_AID_PROTECTED';
     throw err;
   }
 
-  const existing = targetAid ? ledger.stateRecords[targetAid] : null;
+  // 2. Strict Ownership Protection for ANY existing AID (prevents hijacking by aid OR same agentName)
+  if (existing && !isAdmin) {
+    const providedHash = providedOwnerSecret ? sha256Hex(providedOwnerSecret) : '';
+    if (!existing.ownerKeyHash || !providedOwnerSecret || !safeEqual(providedHash, existing.ownerKeyHash)) {
+      const err = new Error(
+        `权限拒绝：AID ${targetAid} (${existing.agentName}) 已注册且受所有权保护！更新地址必须提供首次注册时颁发的 X-Aid-Owner-Secret 或管理员凭证 X-Chain-Admin-Key。`
+      );
+      err.code = 'CHAIN_AID_OWNERSHIP_PROTECTED';
+      throw err;
+    }
+  }
+
+  // Disallow non-admins from inventing arbitrary nonexistent AIDs (must register sequentially without specifying `aid`)
+  if (targetAid && !existing && !isAdmin) {
+    const err = new Error(
+      `非法请求：AID ${targetAid} 尚未注册。新用户请不要手填 aid，直接注册以获取系统按顺序分配的下一个 AID (${ledger.nextAidNumber || 1})。`
+    );
+    err.code = 'INVALID_ARBITRARY_AID';
+    throw err;
+  }
+
   const isUpdate = Boolean(existing);
   const assignedAid = targetAid || String(ledger.nextAidNumber || 1);
 
   const numAssigned = Number(assignedAid);
   if (Number.isFinite(numAssigned) && numAssigned >= (ledger.nextAidNumber || 1)) {
     ledger.nextAidNumber = numAssigned + 1;
+  }
+
+  // Issue a new one-time ownerSecret ONLY on brand-new registration
+  let issuedOwnerSecret = null;
+  let ownerKeyHash = existing ? existing.ownerKeyHash : null;
+  if (!isUpdate) {
+    issuedOwnerSecret = providedOwnerSecret || `aid_${assignedAid}_${crypto.randomBytes(16).toString('hex')}`;
+    ownerKeyHash = sha256Hex(issuedOwnerSecret);
   }
 
   const zeroHash = '0x0000000000000000000000000000000000000000000000000000000000000000';
@@ -308,7 +378,8 @@ function registerOrUpdateAIDOnLedger(
     tags: parsedTags,
     description: description || (existing ? existing.description : '个人Agent节点'),
     httpsEndpoint: String(httpsEndpoint).replace(/\/+$/, ''),
-    mailboxAddress: mailboxAddress !== undefined ? mailboxAddress : (existing ? existing.mailboxAddress : null)
+    mailboxAddress: mailboxAddress !== undefined ? mailboxAddress : (existing ? existing.mailboxAddress : null),
+    ownerKeyHash
   };
 
   const txHash = sha256Hex(`${action}:${blockNumber}:${payload.aid}:${payload.httpsEndpoint}:${timestamp}`);
@@ -327,7 +398,7 @@ function registerOrUpdateAIDOnLedger(
     blockHash,
     timestamp,
     txHash,
-    authority: `AID_${assignedAid}`,
+    authority: isAdmin ? 'CHAIN_ADMIN' : `AID_${assignedAid}`,
     action,
     payload
   };
@@ -345,13 +416,17 @@ function registerOrUpdateAIDOnLedger(
 
   saveLedger(ledger);
 
-  return {
+  const response = {
     isUpdate,
     assignedAid,
     block: newBlock,
     record: ledger.stateRecords[assignedAid],
     chainHeight: ledger.blockHeight
   };
+  if (issuedOwnerSecret) {
+    response.ownerSecret = issuedOwnerSecret;
+  }
+  return response;
 }
 
 function registerNewSequentialAID(options) {
@@ -363,7 +438,7 @@ function updateExistingAID(options) {
   const ledger = loadLedger();
   return registerOrUpdateAIDOnLedger(ledger, {
     ...options,
-    allowUpdateAid1: Boolean(options.isAdmin)
+    isAdmin: Boolean(options.isAdmin)
   });
 }
 
@@ -385,7 +460,11 @@ function searchChainRecords({ query = '', tag = '' } = {}, customLedger = null) 
 module.exports = {
   LOCAL_ANCHOR_LEDGER_FILE,
   TMP_LEDGER_FILE,
-  ANCHOR_HOST_URL,
+  getAnchorHostUrl,
+  getAnchorSecret,
+  sha256Hex,
+  safeEqual,
+  computeBlockHash,
   createEmptyLedger,
   saveLedger,
   loadLedger,

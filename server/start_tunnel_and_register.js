@@ -9,7 +9,7 @@
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
-const { startHostServer, HOST_AID, HOST_NAME, HOST_TAGS } = require('./host_server');
+const { startHostServer, getLocalControlToken, HOST_AID, HOST_NAME, HOST_TAGS } = require('./host_server');
 const { registerAIDOnChain } = require('./discovery_store');
 
 const PORT = Number(process.env.PORT || 3100);
@@ -64,7 +64,10 @@ async function registerPermanentEndpoint() {
   try {
     await fetch(`http://127.0.0.1:${PORT}/host/publish-endpoint`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-host-local-token': getLocalControlToken()
+      },
       body: JSON.stringify({
         httpsEndpoint: PERMANENT_HTTPS_URL,
         tags: HOST_TAGS

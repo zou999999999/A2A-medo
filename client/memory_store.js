@@ -510,6 +510,30 @@ class ClientMemoryStore {
     return item;
   }
 
+  /**
+   * Mark queued offline messages as delivered after cross-machine HTTP outbox flush succeeds
+   */
+  markPendingOutboxDelivered(hostAid, deliveredMsgIds = []) {
+    if (!Array.isArray(deliveredMsgIds) || deliveredMsgIds.length === 0) return 0;
+    const deliveredSet = new Set(deliveredMsgIds);
+    const host = this.ensureHost(hostAid);
+    const before = host.pendingOutbox.length;
+    host.pendingOutbox = host.pendingOutbox.filter((item) => !deliveredSet.has(item.msgId));
+
+    // Update local transcript markers from offlineQueued -> delivered
+    for (const m of host.continuousSession.messages) {
+      if (deliveredSet.has(m.msgId)) m.offlineQueued = false;
+    }
+    for (const t of Object.values(host.tasks)) {
+      for (const m of t.messages) {
+        if (deliveredSet.has(m.msgId)) m.offlineQueued = false;
+      }
+    }
+
+    this.save();
+    return before - host.pendingOutbox.length;
+  }
+
   getHostMemorySummary(hostAid) {
     const host = this.ensureHost(hostAid);
     return {

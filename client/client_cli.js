@@ -246,6 +246,18 @@ async function main() {
     return;
   }
 
+  if (cmd === 'flush-outbox') {
+    const hostAid = positional[1] || TARGET_HOST_AID;
+    if (!hostAid) {
+      console.error('用法: node client_cli.js flush-outbox <hostAid>');
+      process.exit(1);
+    }
+    const res = await client.flushPendingOutbox(hostAid);
+    console.log(`📤 [跨机离线待发队列补发结果 (${hostAid})]:`);
+    console.log(JSON.stringify(res, null, 2));
+    return;
+  }
+
   if (cmd === 'mailbox') {
     const mails = checkClientMailbox(client.clientAid, { unreadOnly: false, markAsRead: true });
     console.log(`📬 [Client (${client.clientAid}) 收件箱] 共 ${mails.length} 封信件:`);
@@ -263,6 +275,7 @@ async function main() {
   node client_cli.js list <hostAid>                                          (改造版 ListTasks: 会话与任务列表)
   node client_cli.js end-task <hostAid> <taskId> [--summary "极简档案结论"]   (改造版 CancelTask: 双端幂等结案与极简提纯)
   node client_cli.js recall-task <hostAid> <taskId> [--reason "原因"]        (按极简档案索引显式调阅已归档 Task 原始记录)
+  node client_cli.js flush-outbox <hostAid>                                  (跨机重连补发: 将本机离线待发队列通过 HTTPS 补发给对方)
   node client_cli.js memory <hostAid> [--task <taskId>]                      (查看三层隔离记忆与 Top-K 极简档案)`);
 }
 

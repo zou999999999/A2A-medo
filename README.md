@@ -33,11 +33,20 @@
    - 结案后原始聊天记录转入本地冷档案（`archived: true`），对后续新任务**物理沙箱隔离（不可偷看）**；
    - 提炼带 `[sourceTaskId]` 索引指针与 `tags` 标签的**《极简档案》**，并更新固定 200 字以内的**《对端滚动总画像》**；开启新任务时仅通过 **Top-3 相关性漏斗**注入最匹配的 3 条极简档案，就算积累几万份档案也绝不发生上下文污染；如遇纠纷需查原话，可凭 `sourceTaskId` 显式调用 `RecallArchivedTask` 审计调卷。
 
-### 4. 公网私链与持久化机制（`chain/` + `vercel.json`）
-- **顺序排号与防覆盖保护**：公网私链基于 SHA-256 哈希链实现，新节点调用 `POST /chain/register` 自动按顺序递增分配 `AID`（`2 -> 3 -> 4...`），创世节点 `AID = 1` 受保护；
-- **适配临时反向隧道**：已注册节点（如每次重开临时隧道更换地址的节点）再次传 `aid` 或同名 `agentName` 即可免密原地更新最新 `https://` 地址；
-- **主节点硬盘持久化方案**：在 Vercel 后台配置环境变量 `ANCHOR_HOST_URL` 后，私链每次变更自动同步写入主节点电脑本地硬盘（`server/data/chain_ledger.json`），Vercel 实例冷启动时自动拉回，零数据库配置且不丢数据；
-- **邮箱字段可选**：`mailboxAddress` 默认为 `null`（Optional 可选项）。
+### 4. 公网私链治理、硬盘锚点持久化与安全隔离机制（`chain/` + `server/` + `vercel.json`）
+- **顺序排号与所有权保护**：
+  - 新节点首次调用 `POST /chain/register` 自动按顺序递增分配 `AID`（`2 -> 3 -> 4...`），并颁发一次性 `ownerSecret`（链上仅存 SHA-256 哈希 `ownerKeyHash`，不存明文）；
+  - 创世节点 `AID = 1` 仅允许携带 Vercel 环境变量配置的管理员密钥 `X-Chain-Admin-Key` 修改（严禁由请求体传入特权开关）；
+  - 已注册的普通节点（如每次使用临时反向隧道的节点）再次传 `aid` 或同名 `agentName` 更新最新 `https://` 地址时，校验 `X-Aid-Owner-Secret` 请求头（`server/host_cli.js` 会自动保存在本地 `server/data/host_identity.json` 并在每次更新时自动携带，零手工记忆负担）。
+- **主节点硬盘锚点持久化机制（`/chain-anchor/ledger`）与边界声明**：
+  - 在 Vercel 后台配置环境变量 `ANCHOR_HOST_URL`（主节点公网入口）、`ANCHOR_SECRET`（与主节点共享的鉴权密钥）及 `CHAIN_ADMIN_KEY` 后，Vercel 网关读写账本时自动携带 `X-Anchor-Secret` 与主节点 `GET / POST /chain-anchor/ledger` 双向同步，落盘前强制校验 SHA-256 哈希链与区块高度单调递增；
+  - **边界说明（实事求是）**：当主节点电脑开机在线时，变更会实时落盘抗 Vercel `/tmp` 回收；若主节点处于关机离线窗口，期间的新注册会暂存在 Vercel `/tmp`（若实例在主节点重新上线前回收仍存在丢失风险），且未引入高并发分布式锁，定位为轻量化个人双机联调方案。
+- **本机控制面隔离与防伪造回复**：
+  - Host 的 `/host/*` 管理接口（`/host/inbox`、`/host/reply`、`/host/cancel-task` 等）内置**双重本机锁**：直接拒绝携带反向代理转发头（`x-forwarded-*`）或非本机 `127.0.0.1` 的公网隧道请求，并强制校验自动生成的本机随机令牌 `X-Host-Local-Token`；
+  - `SendMessage` 的 `autoReplyText` 仅在单元测试开关 `ALLOW_TEST_AUTO_REPLY=true` 下生效，生产默认禁用，杜绝远程 Client 伪造 Host 发言。
+- **跨机离线队列重连补发 & 可选邮箱**：
+  - 当跨机通信遇到对方关机时，消息保存在 Client 本机 `pendingOutbox`；对方重新开机后，Client 下次通信或运行 `flush-outbox <aid>` 时自动通过 HTTPS 将积压的离线消息补发给对方（服务端按原 `msgId` 幂等去重）；
+  - 邮箱字段（`mailboxAddress`）默认为 `null`（Optional 可选项）。
 
 ---
 

@@ -20,13 +20,13 @@ node ./server/host_server.js
 
 ### 2. 在私链上注册或原地更新你的最新临时 HTTPS 隧道地址
 ```bash
-# 首次运行会自动按顺序分配 AID（例如 AID = 2）并保存在本地 server/data/host_identity.json；
-# 后续每次换了新的临时隧道地址，再次运行同一条命令（或传 --aid 2），私链会免密直接原地更新 AID = 2 的最新地址，并自动同步持久化至主节点硬盘！
+# 首次运行会自动按顺序分配 AID（例如 AID = 2），并把私链颁发的所有权密钥 ownerSecret 自动保存在本地 server/data/host_identity.json；
+# 后续每次换了新的临时隧道地址，再次运行同一条命令，CLI 会自动携带 X-Aid-Owner-Secret 原地更新 AID = 2 的最新地址！
 node ./server/host_cli.js register-chain --name "muse" --url "https://你的最新临时隧道地址" --tags "Muse,通用协同"
 ```
-> 也可以直接通过 HTTP POST 更新私链：
-> `POST https://a2a-medo.vercel.app/chain/register`
-> Body: `{"aid": "2", "agentName": "muse", "httpsEndpoint": "https://你的最新临时隧道地址", "tags": ["Muse", "通用协同"]}`
+> 也可以直接通过 HTTP POST 注册或更新私链：
+> - 首次注册：`POST https://a2a-medo.vercel.app/chain/register`，Body: `{"agentName": "muse", "httpsEndpoint": "https://你的临时地址", "tags": ["Muse", "通用协同"]}` -> 返回 `assignedAid` 与 **`ownerSecret`**（请保存！）
+> - 后续更新临时隧道地址：同接口加请求头 `X-Aid-Owner-Secret: <你的ownerSecret>`，Body: `{"aid": "2", "agentName": "muse", "httpsEndpoint": "https://你的最新临时地址"}`
 
 ---
 
@@ -68,8 +68,11 @@ node ./client/client_cli.js end-task 1 task-01 --summary "已完成跨机联调�
 
 # 按极简档案中的 sourceTaskId 索引显式审计调阅已归档任务的原始对话
 node ./client/client_cli.js recall-task 1 task-01 --reason "核对历史约定细节"
+
+# 若对方之前关机导致消息积压在本机 pendingOutbox，对方开机后可手动（或下次发消息时自动）跨机补发
+node ./client/client_cli.js flush-outbox 1
 ```
-> 💡 **提示**：当对端更换临时隧道导致旧 `https://` 失效时，Client SDK 会自动向 `https://a2a-medo.vercel.app` 重新查询对方 AID 的最新地址并重发；另外 `mailboxAddress` 为可选字段，当前默认留空为 `null`。
+> 💡 **提示**：当对端更换临时隧道导致旧 `https://` 失效时，Client SDK 会自动向 `https://a2a-medo.vercel.app` 重新查询对方 AID 的最新地址并重发；若对方关机，消息会安全保存在本机 `pendingOutbox` 并在对方重连上线后自动通过 HTTPS 补发；另外 `mailboxAddress` 为可选字段，当前默认留空为 `null`。
 
 ---
 

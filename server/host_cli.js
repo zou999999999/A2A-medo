@@ -57,6 +57,17 @@ async function main() {
   const cmd = positional[0] || 'help';
   const memoryStore = new HostMemoryStore(HOST_AID);
 
+const LOCAL_TOKEN_FILE = path.resolve(__dirname, 'data', 'local_control_token');
+function readLocalControlToken() {
+  if (process.env.HOST_LOCAL_TOKEN) return process.env.HOST_LOCAL_TOKEN;
+  try {
+    if (fs.existsSync(LOCAL_TOKEN_FILE)) return fs.readFileSync(LOCAL_TOKEN_FILE, 'utf-8').trim();
+  } catch {
+    // ignore
+  }
+  return '';
+}
+
   if (cmd === 'register-chain' || cmd === 'update-chain') {
     const targetAid = flags.aid || savedIdentity.aid || null;
     const newName = flags.name || positional[1] || savedIdentity.name || HOST_NAME;
@@ -65,10 +76,15 @@ async function main() {
       ? flags.tags.split(',').map((s) => s.trim())
       : (savedIdentity.tags || []);
     const newDesc = flags.desc || savedIdentity.description || '个人Agent节点';
+    const ownerSecret = flags.secret || savedIdentity.ownerSecret || '';
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (ownerSecret) headers['x-aid-owner-secret'] = ownerSecret;
+    if (process.env.CHAIN_ADMIN_KEY) headers['x-chain-admin-key'] = process.env.CHAIN_ADMIN_KEY;
 
     const resp = await fetch(`${DEFAULT_PRIVATE_CHAIN_URL}/chain/register`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         aid: targetAid && targetAid !== 'unregistered-host' ? targetAid : undefined,
         agentName: newName,
@@ -86,8 +102,10 @@ async function main() {
     if (!fs.existsSync(path.dirname(IDENTITY_FILE))) {
       fs.mkdirSync(path.dirname(IDENTITY_FILE), { recursive: true });
     }
+    const persistedSecret = data.ownerSecret || ownerSecret || savedIdentity.ownerSecret || null;
     const identityObj = {
       aid: data.assignedAid,
+      ownerSecret: persistedSecret,
       name: newName,
       tags: newTags,
       description: newDesc,
@@ -96,10 +114,13 @@ async function main() {
     };
     fs.writeFileSync(IDENTITY_FILE, JSON.stringify(identityObj, null, 2), 'utf-8');
     console.log(`✅ [${data.isUpdate ? '链上临时隧道地址原地更新成功' : '链上按序注册成功'} —— Block #${data.block.blockNumber}]`);
-    console.log(`   • 节点 AID     : ${data.assignedAid}`);
-    console.log(`   • 节点名称     : ${newName}`);
-    console.log(`   • 最新 HTTPS   : ${newUrl}`);
-    console.log(`   • 主节点硬盘同步: ${data.persistedToAnchorHost ? '✅ 已永久同步至主节点电脑硬盘' : '⚠️ 已存入私链内存'}`);
+    console.log(`   • 节点 AID      : ${data.assignedAid}`);
+    console.log(`   • 节点名称      : ${newName}`);
+    console.log(`   • 最新 HTTPS    : ${newUrl}`);
+    if (data.ownerSecret) {
+      console.log(`   • 专属所有权凭证 : 已自动保存至本地 server/data/host_identity.json（后续更新自动携带）`);
+    }
+    console.log(`   • 主节点硬盘同步: ${data.persistedToAnchorHost ? '✅ 已验权并同步落盘至主节点电脑硬盘' : '⚠️ 已存入私链内存'}`);
     return;
   }
 
@@ -234,7 +255,10 @@ async function main() {
     try {
       const resp = await fetch(`http://127.0.0.1:${PORT}/host/reply`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-host-local-token': readLocalControlToken()
+        },
         body: JSON.stringify({ toAid, mode, taskId, text, messageType, proposal })
       });
       if (resp.ok) {

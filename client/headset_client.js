@@ -273,7 +273,7 @@ class A2AHeadsetClient {
       `   • 访问 HTTPS 地址: ${httpsEndpoint || '未找到地址'}\n` +
       `   • 失联诊断原因   : ${diagnosis}\n` +
       `   • 最后在线时间   : ${lastSeen}\n` +
-      `   • 自动兜底处理   : 消息未丢失！已自动转为【离线留言】投递至 ${hostAid} 的收件箱 (MailID: ${fallbackMail.mailId})，同时记入本地对话记忆。待对方开机后会自动收到未接提醒！`;
+      `   • 自动兜底处理   : 消息未丢失！已存入本机待发队列 (pendingOutbox) 并写入离线记录 (MailID: ${fallbackMail.mailId})。待对方重新上线后，本机再次通信或运行 flush-outbox 时将自动通过 HTTPS 跨机补发！`;
 
     return {
       alertCode: 'HOST_OFFLINE_OR_UNREACHABLE',
@@ -428,7 +428,92 @@ class A2AHeadsetClient {
       return { ok: false, error: callRes.rpc.error };
     }
 
-    return this._processSendMessageSuccess(hostAid, callRes.rpc.result);
+    const processed = this._processSendMessageSuccess(hostAid, callRes.rpc.result);
+    // Cross-machine offline recovery: if any earlier messages were queued in pendingOutbox while Host was off, flush them now!
+    const hostMem = this.memory.ensureHost(hostAid);
+    if (hostMem.pendingOutbox.length > 0) {
+      processed.flushedOfflineOutbox = await this.flushPendingOutbox(hostAid);
+    }
+    return processed;
+  }
+
+  /**
+   * Cross-Machine Offline Outbox Flush (`flushPendingOutbox`):
+   * Re-sends messages queued in local `pendingOutbox` over real HTTPS to Host's `/a2a` endpoint
+   * once Host comes back online (deduplicated safely on Host side by original `msgId`).
+   */
+  async flushPendingOutbox(hostAid) {
+    const hostMem = this.memory.ensureHost(hostAid);
+    if (!hostMem.pendingOutbox || hostMem.pendingOutbox.length === 0) {
+      return { ok: true, flushedCount: 0, remainingCount: 0, delivered: [] };
+    }
+
+    let resolved = await this.resolveEndpointAsync(hostAid);
+    if (!resolved.httpsEndpoint) {
+      resolved = await this.resolveEndpointAsync(hostAid, { forceRefresh: true });
+    }
+    if (!resolved.httpsEndpoint) {
+      return {
+        ok: false,
+        flushedCount: 0,
+        remainingCount: hostMem.pendingOutbox.length,
+        error: `Unable to resolve HTTPS endpoint for Host ${hostAid}`
+      };
+    }
+
+    const deliveredIds = [];
+    const deliveredResults = [];
+    const snapshot = [...hostMem.pendingOutbox];
+
+    for (const item of snapshot) {
+      let callRes = await this._callHostRpc(hostAid, resolved.httpsEndpoint, 'SendMessage', {
+        fromAid: this.clientAid,
+        fromEndpoint: this.clientEndpoint,
+        mode: item.mode || 'session',
+        taskId: item.taskId === 'session' ? null : item.taskId,
+        topic: item.topic || null,
+        text: item.text,
+        msgId: item.msgId
+      });
+
+      if (!callRes.ok) {
+        const refreshed = await this.resolveEndpointAsync(hostAid, { forceRefresh: true });
+        if (refreshed.httpsEndpoint && refreshed.httpsEndpoint !== resolved.httpsEndpoint) {
+          resolved = refreshed;
+          callRes = await this._callHostRpc(hostAid, resolved.httpsEndpoint, 'SendMessage', {
+            fromAid: this.clientAid,
+            fromEndpoint: this.clientEndpoint,
+            mode: item.mode || 'session',
+            taskId: item.taskId === 'session' ? null : item.taskId,
+            topic: item.topic || null,
+            text: item.text,
+            msgId: item.msgId
+          });
+        }
+      }
+
+      if (callRes.ok && callRes.rpc && !callRes.rpc.error) {
+        deliveredIds.push(item.msgId);
+        this._processSendMessageSuccess(hostAid, callRes.rpc.result);
+        deliveredResults.push({
+          msgId: item.msgId,
+          mode: item.mode,
+          taskId: item.taskId,
+          text: item.text
+        });
+      } else {
+        // Stop early if Host went offline again
+        break;
+      }
+    }
+
+    const flushedCount = this.memory.markPendingOutboxDelivered(hostAid, deliveredIds);
+    return {
+      ok: flushedCount === snapshot.length,
+      flushedCount,
+      remainingCount: this.memory.ensureHost(hostAid).pendingOutbox.length,
+      delivered: deliveredResults
+    };
   }
 
   _processSendMessageSuccess(hostAid, result) {
@@ -538,10 +623,17 @@ class A2AHeadsetClient {
 
     const guardEvaluation = this._inspectCounterQuestions(hostAid, res.taskId, res.messages || []);
 
+    let flushedOfflineOutbox = null;
+    const hostMem = this.memory.ensureHost(hostAid);
+    if (hostMem.pendingOutbox.length > 0) {
+      flushedOfflineOutbox = await this.flushPendingOutbox(hostAid);
+    }
+
     return {
       ok: true,
       ...res,
-      counterQuestionGuard: guardEvaluation
+      counterQuestionGuard: guardEvaluation,
+      flushedOfflineOutbox
     };
   }
 

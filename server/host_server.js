@@ -17,6 +17,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
+const crypto = require('node:crypto');
 const {
   registerAIDOnChain,
   resolveAIDFromChain,
@@ -26,7 +27,115 @@ const {
 } = require('./discovery_store');
 const { HostMemoryStore } = require('./memory_store');
 
-const LOCAL_CHAIN_LEDGER_FILE = path.resolve(__dirname, 'data', 'chain_ledger.json');
+const LOCAL_CHAIN_LEDGER_FILE = process.env.LOCAL_CHAIN_LEDGER_FILE
+  ? path.resolve(process.env.LOCAL_CHAIN_LEDGER_FILE)
+  : path.resolve(__dirname, 'data', 'chain_ledger.json');
+const ANCHOR_SECRETS_FILE = path.resolve(__dirname, 'data', 'anchor_secrets.json');
+const LOCAL_TOKEN_FILE = path.resolve(__dirname, 'data', 'local_control_token');
+
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a || ''), 'utf8');
+  const bufB = Buffer.from(String(b || ''), 'utf8');
+  if (bufA.length === 0 || bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function getAnchorSecret() {
+  if (process.env.ANCHOR_SECRET) return process.env.ANCHOR_SECRET;
+  try {
+    if (fs.existsSync(ANCHOR_SECRETS_FILE)) {
+      const s = JSON.parse(fs.readFileSync(ANCHOR_SECRETS_FILE, 'utf-8'));
+      if (s.anchorSecret) return s.anchorSecret;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function getLocalControlToken() {
+  if (process.env.HOST_LOCAL_TOKEN) return process.env.HOST_LOCAL_TOKEN;
+  try {
+    if (fs.existsSync(LOCAL_TOKEN_FILE)) {
+      const existing = fs.readFileSync(LOCAL_TOKEN_FILE, 'utf-8').trim();
+      if (existing) return existing;
+    }
+  } catch {
+    // ignore
+  }
+  const generated = 'local_' + crypto.randomBytes(24).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(LOCAL_TOKEN_FILE), { recursive: true });
+    fs.writeFileSync(LOCAL_TOKEN_FILE, generated, 'utf-8');
+  } catch {
+    // ignore
+  }
+  return generated;
+}
+
+function verifyIncomingLedgerIntegrity(ledger) {
+  if (!ledger || !Array.isArray(ledger.blocks) || typeof ledger.stateRecords !== 'object') {
+    return { valid: false, reason: 'Malformed ledger structure' };
+  }
+  const zeroHash = '0x0000000000000000000000000000000000000000000000000000000000000000';
+  for (let i = 0; i < ledger.blocks.length; i++) {
+    const b = ledger.blocks[i];
+    const expectedPrev = i === 0 ? zeroHash : ledger.blocks[i - 1].blockHash;
+    if (b.prevBlockHash !== expectedPrev) {
+      return { valid: false, reason: `Block #${i} prevBlockHash mismatch` };
+    }
+    const canonical = JSON.stringify({
+      blockNumber: b.blockNumber,
+      prevBlockHash: b.prevBlockHash,
+      timestamp: b.timestamp,
+      txHash: b.txHash,
+      action: b.action,
+      payload: b.payload
+    });
+    const recomputed = '0x' + crypto.createHash('sha256').update(canonical).digest('hex');
+    if (b.blockHash !== recomputed) {
+      return { valid: false, reason: `Block #${i} blockHash tampered` };
+    }
+  }
+  return { valid: true };
+}
+
+/**
+ * Dual-Layer Local-Only Guard for all `/host/*` Control APIs:
+ *   Layer 1: Rejects any request forwarded through a reverse proxy / public tunnel (`x-forwarded-*`)
+ *            or originating from a non-loopback socket / non-localhost Host header.
+ *   Layer 2: Requires the auto-generated local control token (`X-Host-Local-Token`).
+ */
+function checkLocalControlAuth(req) {
+  if (req.headers['x-forwarded-for'] || req.headers['x-forwarded-host'] || req.headers['forwarded']) {
+    return {
+      ok: false,
+      code: 'PUBLIC_TUNNEL_FORWARDED_REQUEST_BLOCKED',
+      message: '🔒 安全拦截：/host/* 本机控制接口禁止通过公网隧道/反向代理访问！'
+    };
+  }
+  const remoteAddr = req.socket?.remoteAddress || '';
+  const isLoopback = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+  const hostHeader = String(req.headers.host || '').toLowerCase();
+  const isLocalHostHeader = hostHeader.startsWith('127.0.0.1') || hostHeader.startsWith('localhost');
+  if (!isLoopback || !isLocalHostHeader) {
+    return {
+      ok: false,
+      code: 'NON_LOOPBACK_ORIGIN_BLOCKED',
+      message: '🔒 安全拦截：/host/* 接口仅允许本机 127.0.0.1/localhost 直连访问！'
+    };
+  }
+  const expectedToken = getLocalControlToken();
+  const providedToken = req.headers['x-host-local-token'] || '';
+  if (!safeEqual(providedToken, expectedToken)) {
+    return {
+      ok: false,
+      code: 'INVALID_HOST_LOCAL_TOKEN',
+      message: '🔒 安全拦截：缺少或无效的本机控制令牌 (X-Host-Local-Token)！'
+    };
+  }
+  return { ok: true };
+}
 
 const IDENTITY_FILE = path.resolve(__dirname, 'data', 'host_identity.json');
 function loadHostIdentity() {
@@ -254,10 +363,13 @@ async function handleA2ARpc(body) {
     }
 
     // 3. Check if Host has auto-reply or immediate reply waiter
+    // SECURITY: Remote clients are NEVER allowed to inject `autoReplyText` in production!
+    // `autoReplyText` is strictly gated behind `process.env.ALLOW_TEST_AUTO_REPLY === 'true'` for unit tests only.
+    const effectiveAutoReplyText = process.env.ALLOW_TEST_AUTO_REPLY === 'true' ? autoReplyText : null;
     let hostReply = null;
-    if (AUTO_REPLY_ENABLED || autoReplyText) {
+    if (AUTO_REPLY_ENABLED || effectiveAutoReplyText) {
       const replyContent =
-        autoReplyText ||
+        effectiveAutoReplyText ||
         `[${HOST_NAME} 耳机自动应答] 已收到你在${mode === 'session' ? '连续会话' : `任务(${activeTaskId})`}中的第 ${recorded.message.seq} 条消息：“${text}”`;
       const replyRecorded = memoryStore.appendMessage({
         peerAid: fromAid,
@@ -535,6 +647,18 @@ function createHostServer() {
         return sendJson(res, 200, { ok: true, mailItem, synced });
       }
 
+      // Guard ALL Local Host Agent Control APIs (`/host/*`) against public tunnel exposure
+      if (url.pathname.startsWith('/host/')) {
+        const localCheck = checkLocalControlAuth(req);
+        if (!localCheck.ok) {
+          return sendJson(res, 403, {
+            ok: false,
+            errorCode: localCheck.code,
+            message: localCheck.message
+          });
+        }
+      }
+
       // 4. Local Host Agent Control API: View Unread Inbox & Conversations
       if (req.method === 'GET' && url.pathname === '/host/inbox') {
         syncHostMailboxOnBoot();
@@ -730,36 +854,81 @@ function createHostServer() {
         });
       }
 
-      // 9. Method B Private Chain Hard-Drive Anchor Endpoints (Persists Vercel Private Chain ledger to local disk!)
-      if (req.method === 'GET' && url.pathname === '/chain-anchor/ledger') {
-        try {
-          if (fs.existsSync(LOCAL_CHAIN_LEDGER_FILE)) {
-            const ledger = JSON.parse(fs.readFileSync(LOCAL_CHAIN_LEDGER_FILE, 'utf-8'));
-            return sendJson(res, 200, { ok: true, ledger });
-          }
-        } catch (err) {
-          return sendJson(res, 500, { ok: false, error: err.message });
+      // 9. Method B Private Chain Hard-Drive Anchor Endpoints (Authenticated via X-Anchor-Secret + Hash-Chain Verified!)
+      if (url.pathname === '/chain-anchor/ledger') {
+        const configuredAnchorSecret = getAnchorSecret();
+        const providedAnchorSecret = req.headers['x-anchor-secret'] || '';
+        if (!configuredAnchorSecret || !safeEqual(providedAnchorSecret, configuredAnchorSecret)) {
+          return sendJson(res, 403, {
+            ok: false,
+            errorCode: 'ANCHOR_UNAUTHORIZED',
+            message: '🔒 安全拦截：/chain-anchor/ledger 仅限携带有效共享密钥 (X-Anchor-Secret) 的授权私链网关访问！'
+          });
         }
-        return sendJson(res, 404, { ok: false, error: 'Local ledger file not found' });
-      }
 
-      if (req.method === 'POST' && url.pathname === '/chain-anchor/ledger') {
-        const body = await readJsonBody(req);
-        if (!body.ledger || !body.ledger.blocks || !body.ledger.stateRecords) {
-          return sendJson(res, 400, { ok: false, error: 'Valid ledger object required' });
+        if (req.method === 'GET') {
+          try {
+            if (fs.existsSync(LOCAL_CHAIN_LEDGER_FILE)) {
+              const ledger = JSON.parse(fs.readFileSync(LOCAL_CHAIN_LEDGER_FILE, 'utf-8'));
+              return sendJson(res, 200, { ok: true, ledger });
+            }
+          } catch (err) {
+            return sendJson(res, 500, { ok: false, error: err.message });
+          }
+          return sendJson(res, 404, { ok: false, error: 'Local ledger file not found' });
         }
-        if (!fs.existsSync(path.dirname(LOCAL_CHAIN_LEDGER_FILE))) {
-          fs.mkdirSync(path.dirname(LOCAL_CHAIN_LEDGER_FILE), { recursive: true });
+
+        if (req.method === 'POST') {
+          const body = await readJsonBody(req);
+          const integrity = verifyIncomingLedgerIntegrity(body.ledger);
+          if (!integrity.valid) {
+            return sendJson(res, 400, {
+              ok: false,
+              errorCode: 'INVALID_LEDGER_HASH_CHAIN',
+              message: `拒绝落盘：账本哈希链校验失败 (${integrity.reason})`
+            });
+          }
+
+          // Enforce monotonic blockHeight & Genesis Block #0 immutability against existing local ledger
+          if (fs.existsSync(LOCAL_CHAIN_LEDGER_FILE)) {
+            try {
+              const existing = JSON.parse(fs.readFileSync(LOCAL_CHAIN_LEDGER_FILE, 'utf-8'));
+              if ((existing.blocks || []).length > 0) {
+                if (body.ledger.blocks.length < existing.blocks.length) {
+                  return sendJson(res, 409, {
+                    ok: false,
+                    errorCode: 'LEDGER_ROLLBACK_REJECTED',
+                    message: `拒绝落盘：新账本高度 (${body.ledger.blocks.length}) 小于本机已有高度 (${existing.blocks.length})`
+                  });
+                }
+                if (body.ledger.blocks[0].blockHash !== existing.blocks[0].blockHash) {
+                  return sendJson(res, 409, {
+                    ok: false,
+                    errorCode: 'GENESIS_BLOCK_MISMATCH',
+                    message: '拒绝落盘：创世区块 Block #0 哈希与本机不匹配！'
+                  });
+                }
+              }
+            } catch {
+              // ignore corrupted local read
+            }
+          }
+
+          if (!fs.existsSync(path.dirname(LOCAL_CHAIN_LEDGER_FILE))) {
+            fs.mkdirSync(path.dirname(LOCAL_CHAIN_LEDGER_FILE), { recursive: true });
+          }
+          const tmpFile = `${LOCAL_CHAIN_LEDGER_FILE}.tmp.${process.pid}.${Date.now()}`;
+          fs.writeFileSync(tmpFile, JSON.stringify(body.ledger, null, 2), 'utf-8');
+          fs.renameSync(tmpFile, LOCAL_CHAIN_LEDGER_FILE);
+          console.log(
+            `⛓️  [私链账本已验权并同步落盘至本机硬盘] 区块高度: ${body.ledger.blockHeight} | 已注册 AID 数: ${Object.keys(body.ledger.stateRecords).length}`
+          );
+          return sendJson(res, 200, {
+            ok: true,
+            savedBlockHeight: body.ledger.blockHeight,
+            totalRegisteredAIDs: Object.keys(body.ledger.stateRecords).length
+          });
         }
-        fs.writeFileSync(LOCAL_CHAIN_LEDGER_FILE, JSON.stringify(body.ledger, null, 2), 'utf-8');
-        console.log(
-          `⛓️  [私链账本已同步落盘至本机硬盘] 区块高度: ${body.ledger.blockHeight} | 已注册 AID 数: ${Object.keys(body.ledger.stateRecords).length}`
-        );
-        return sendJson(res, 200, {
-          ok: true,
-          savedBlockHeight: body.ledger.blockHeight,
-          totalRegisteredAIDs: Object.keys(body.ledger.stateRecords).length
-        });
       }
 
       return sendJson(res, 404, { error: `Route not found: ${req.method} ${url.pathname}` });
@@ -816,6 +985,8 @@ module.exports = {
   HOST_NAME,
   HOST_TAGS,
   memoryStore,
+  getLocalControlToken,
+  getAnchorSecret,
   createHostServer,
   startHostServer,
   syncHostMailboxOnBoot

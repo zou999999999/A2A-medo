@@ -24,15 +24,23 @@ const testTempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'a2a_e2e_test_'));
 process.env.NETWORK_STATE_DIR = path.join(testTempRoot, 'network_state');
 process.env.HOST_MEMORY_FILE = path.join(testTempRoot, 'host_memory.json');
 process.env.CLIENT_MEMORY_FILE = path.join(testTempRoot, 'client_memory.json');
+process.env.LOCAL_CHAIN_LEDGER_FILE = path.join(testTempRoot, 'chain_ledger.json');
 process.env.HOST_AID = 'host-1001';
 process.env.HOST_NAME = 'Alpha-Host-Headset';
 process.env.PRIVATE_CHAIN_URL = '';
+process.env.ALLOW_TEST_AUTO_REPLY = 'true';
+process.env.HOST_LOCAL_TOKEN = 'test_local_token_e2e';
+process.env.ANCHOR_SECRET = 'test_anchor_secret_e2e';
+process.env.CHAIN_ADMIN_KEY = 'test_chain_admin_key_e2e';
 
+const http = require('node:http');
 const { startHostServer, memoryStore: hostMemory } = require('../server/host_server');
 const { sendToMailbox } = require('../server/discovery_store');
 const { A2AHeadsetClient } = require('./headset_client');
 const { ClientMemoryStore } = require('./memory_store');
 const { HostMemoryStore } = require('../server/memory_store');
+const chainHandler = require('../chain/api');
+const { createEmptyLedger, saveLedger, TMP_LEDGER_FILE, registerOrUpdateAIDOnLedger } = require('../chain/chain_engine');
 
 async function runTests() {
   console.log('======================================================================');
@@ -109,7 +117,10 @@ async function runTests() {
   // 第 2 轮：Host 在【同一个 taskId1】内发起反问/高价推销（8500 元 + 某高价廉航），试图忽悠直接锁单
   await fetch(`${endpointUrl}/host/reply`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-host-local-token': process.env.HOST_LOCAL_TOKEN
+    },
     body: JSON.stringify({
       toAid: 'client-2002',
       mode: 'task',
@@ -207,7 +218,10 @@ async function runTests() {
     }),
     fetch(`${endpointUrl}/host/cancel-task`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-host-local-token': process.env.HOST_LOCAL_TOKEN
+      },
       body: JSON.stringify({
         peerAid: 'client-2002',
         taskId: taskId1,
@@ -344,10 +358,162 @@ async function runTests() {
   assert.equal(task2AfterReboot.totalMessages, 2, 'Host 重新开机后应自动把离线留言恢复进 task-hk-rebook-02 的第 2 轮');
   console.log(`✅ 8.2 Host 重新开机收件箱自检恢复通过: 离线留言已精准汇入任务 ${taskId2} 第 2 轮`);
 
+  // ---------------------------------------------------------------------------
+  // 场景 9：安全边界加固验证（封死公网 /host/*、锚点落盘验权、真 AID 1 保护 + ownerSecret、禁用公网 autoReplyText、跨机 HTTP 补发队列）
+  // ---------------------------------------------------------------------------
+  console.log('\n--- [测试 9] 安全边界加固与跨机 HTTP 离线补发队列验证 ---');
+
+  // 9.1 公网隧道转发请求（带 x-forwarded-for）打 /host/inbox -> 必须 403 拦截
+  const forwardedHostInbox = await fetch(`${rebooted.endpointUrl}/host/inbox`, {
+    headers: {
+      'x-forwarded-for': '8.8.8.8',
+      'x-host-local-token': process.env.HOST_LOCAL_TOKEN
+    }
+  });
+  assert.equal(forwardedHostInbox.status, 403, '带 x-forwarded-for 的公网隧道请求访问 /host/inbox 必须被 403 拦截');
+  console.log('✅ 9.1 公网隧道访问 /host/inbox 被成功 403 拦截');
+
+  // 9.2 缺失本机令牌打 /host/reply -> 必须 403 拦截
+  const noTokenReply = await fetch(`${rebooted.endpointUrl}/host/reply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ toAid: 'client-2002', text: 'fake reply' })
+  });
+  assert.equal(noTokenReply.status, 403, '缺失 X-Host-Local-Token 的 /host/reply 必须被 403 拦截');
+  console.log('✅ 9.2 无令牌调用 /host/reply 被成功 403 拦截');
+
+  // 9.3 无共享密钥打 /chain-anchor/ledger -> 必须 403 拦截；带密钥但篡改哈希链 -> 必须 400 拦截
+  const unauthAnchor = await fetch(`${rebooted.endpointUrl}/chain-anchor/ledger`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ledger: { blockHeight: 9999, blocks: [], stateRecords: {} } })
+  });
+  assert.equal(unauthAnchor.status, 403, '无 X-Anchor-Secret 访问 /chain-anchor/ledger 必须被 403 拦截');
+
+  const tamperedAnchor = await fetch(`${rebooted.endpointUrl}/chain-anchor/ledger`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-anchor-secret': process.env.ANCHOR_SECRET
+    },
+    body: JSON.stringify({
+      ledger: {
+        blockHeight: 1,
+        blocks: [{ blockNumber: 0, prevBlockHash: '0x0000000000000000000000000000000000000000000000000000000000000000', blockHash: '0xfake', timestamp: '2026', txHash: '0x1', action: 'FAKE', payload: {} }],
+        stateRecords: {}
+      }
+    })
+  });
+  assert.equal(tamperedAnchor.status, 400, '伪造哈希链的账本落盘必须被 400 拦截');
+  console.log('✅ 9.3 /chain-anchor/ledger 无密钥 403 拦截 + 假哈希链 400 拦截通过');
+
+  // 9.4 生产模式下（ALLOW_TEST_AUTO_REPLY=false），远程 Client 传 autoReplyText 严禁注入伪造 Host 回复
+  process.env.ALLOW_TEST_AUTO_REPLY = 'false';
+  const spoofRes = await client.sendMessage({
+    hostAid: 'host-1001',
+    mode: 'session',
+    text: '试图伪造 Host 回复',
+    autoReplyText: '我是假冒的 Host 自动回复！'
+  });
+  assert.equal(spoofRes.ok, true);
+  assert.equal(spoofRes.hostReply, null, '生产环境下必须忽略客户端传入的 autoReplyText，防止冒充 Host 发言');
+  process.env.ALLOW_TEST_AUTO_REPLY = 'true';
+  console.log('✅ 9.4 生产模式下成功屏蔽客户端 autoReplyText 冒充 Host 发言');
+
+  // 9.5 私链真正防篡改校验：拒绝 body.allowUpdateAid1=true 改 AID=1；普通 AID 必须凭 ownerSecret 更新
+  const chainServer = http.createServer(chainHandler);
+  await new Promise((r) => chainServer.listen(0, '127.0.0.1', r));
+  const chainUrl = `http://127.0.0.1:${chainServer.address().port}`;
+  const backupTmp = fs.existsSync(TMP_LEDGER_FILE) ? fs.readFileSync(TMP_LEDGER_FILE, 'utf8') : null;
+  try {
+    process.env.IS_LOCAL_ANCHOR_HOST = 'true';
+    const freshLedger = createEmptyLedger();
+    registerOrUpdateAIDOnLedger(freshLedger, {
+      aid: '1',
+      agentName: 'genesis-node',
+      httpsEndpoint: 'https://genesis.example',
+      isAdmin: true
+    });
+    fs.writeFileSync(TMP_LEDGER_FILE, JSON.stringify(freshLedger, null, 2), 'utf8');
+
+    // 攻击者尝试在 body 里自填 allowUpdateAid1: true 修改 AID=1 -> 必须 403！
+    const fakeAdmin = await fetch(`${chainUrl}/chain/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ aid: '1', allowUpdateAid1: true, httpsEndpoint: 'https://hijack.example' })
+    });
+    assert.equal(fakeAdmin.status, 403, '请求体里的 allowUpdateAid1:true 绝对不能绕过 AID=1 管理员保护');
+
+    // 正常注册 AID=2 -> 获得 ownerSecret
+    const reg2 = await (await fetch(`${chainUrl}/chain/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentName: 'peer-muse', httpsEndpoint: 'https://muse-1.example' })
+    })).json();
+    assert.equal(reg2.ok, true);
+    assert.equal(reg2.assignedAid, '2');
+    assert.ok(reg2.ownerSecret, '新注册必须返回一次性 ownerSecret');
+
+    // 陌生人试图凭同名 agentName 或 aid="2" 无密钥劫持 AID=2 -> 必须 403！
+    const hijack2 = await fetch(`${chainUrl}/chain/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentName: 'peer-muse', httpsEndpoint: 'https://evil-muse.example' })
+    });
+    assert.equal(hijack2.status, 403, '无 X-Aid-Owner-Secret 严禁按同名 agentName 劫持已有 AID');
+
+    // 持有正确 X-Aid-Owner-Secret 更新 AID=2 的临时隧道 -> 200 成功！
+    const validUpdate2 = await (await fetch(`${chainUrl}/chain/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-aid-owner-secret': reg2.ownerSecret
+      },
+      body: JSON.stringify({ aid: '2', httpsEndpoint: 'https://muse-2.example' })
+    })).json();
+    assert.equal(validUpdate2.ok, true);
+    assert.equal(validUpdate2.record.httpsEndpoint, 'https://muse-2.example');
+    console.log('✅ 9.5 私链防劫持验证通过: body.allowUpdateAid1=true 已封死(403), 同名无密更新拦截(403), 凭 ownerSecret 更新通过(200)');
+  } finally {
+    delete process.env.IS_LOCAL_ANCHOR_HOST;
+    if (backupTmp !== null) fs.writeFileSync(TMP_LEDGER_FILE, backupTmp, 'utf8');
+    else if (fs.existsSync(TMP_LEDGER_FILE)) fs.unlinkSync(TMP_LEDGER_FILE);
+    await new Promise((r) => chainServer.close(r));
+  }
+
+  // 9.6 跨机真实离线补发验证（关闭 Host -> Client 队列暂存且不走共享文件 -> 重启 Host -> flushPendingOutbox 通过 HTTP 真实补发）
   await new Promise((resolve) => rebooted.server.close(resolve));
+  // 故意让 Client 写进另一个目录，验证即便不共享 .network_state，靠 flushPendingOutbox 也能跨机 HTTP 补发！
+  const crossMachineTask = 'task-cross-machine-flush';
+  const offlineQueued = await client.sendMessage({
+    hostAid: 'host-1001',
+    mode: 'task',
+    taskId: crossMachineTask,
+    topic: '跨机离线补发验证',
+    text: '这是一条对方关机时积压在 Client 本机待发队列中的消息！'
+  });
+  assert.equal(offlineQueued.ok, false);
+  // 清空模拟的本地共享邮箱文件，确保重启后的 Host 绝不会靠共享文件“作弊”拿到这条消息
+  const sharedMailboxFile = path.join(process.env.NETWORK_STATE_DIR, 'mailbox_store.json');
+  if (fs.existsSync(sharedMailboxFile)) fs.unlinkSync(sharedMailboxFile);
+
+  const rebooted2 = await startHostServer(port);
+  const beforeFlush = hostMemory.getConversation({ peerAid: 'client-2002', mode: 'task', taskId: crossMachineTask });
+  assert.equal(beforeFlush, null, '清除共享文件后，重连补发前 Host 确实尚未收到该跨机离线消息');
+
+  const flushRes = await client.flushPendingOutbox('host-1001');
+  assert.equal(flushRes.ok, true);
+  assert.ok(flushRes.flushedCount >= 1, 'flushPendingOutbox 必须通过 HTTP 将积压的离线消息补发给 Host');
+  assert.equal(flushRes.remainingCount, 0, '补发完成后待发队列应清空为 0');
+
+  const afterFlush = hostMemory.getConversation({ peerAid: 'client-2002', mode: 'task', taskId: crossMachineTask });
+  assert.ok(afterFlush && afterFlush.totalMessages === 1, 'Host 应通过 HTTP 补发真实收到该跨机离线消息');
+  console.log(`✅ 9.6 跨机 HTTP 离线补发队列验证通过: 已补发 ${flushRes.flushedCount} 条离线消息，队列清零`);
+
+  await new Promise((resolve) => rebooted2.server.close(resolve));
 
   console.log('\n======================================================================');
-  console.log('🎉 全部 8 大核心架构与地基机制测试 100% 通过！');
+  console.log('🎉 全部 9 大核心架构、安全边界与跨机补发测试 100% 通过！');
   console.log('======================================================================');
 }
 
