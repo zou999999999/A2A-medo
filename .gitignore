@@ -1,0 +1,14 @@
+node_modules/
+.env
+wallet.json
+secrets/
+archive/
+*.tmp.*
+*.docx
+下一步的构想.txt
+.network_state/
+server/data/
+client/data/
+chain/chain_url.json
+chain/ledger.json
+项目交接与全流程上下文总结.md

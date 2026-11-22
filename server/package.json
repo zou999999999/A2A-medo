@@ -1,0 +1,15 @@
+{
+  "name": "a2a-truechat-host",
+  "version": "1.0.0",
+  "description": "A2A v1 Core Architecture - Host Headset Server (Server Side)",
+  "main": "host_server.js",
+  "scripts": {
+    "start": "node host_server.js",
+    "cli": "node host_cli.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
+

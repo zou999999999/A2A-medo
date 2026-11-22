@@ -1,0 +1,15 @@
+{
+  "name": "a2a-truechat-client",
+  "version": "1.0.0",
+  "description": "A2A v1 Core Architecture - Client Headset SDK & CLI (Client Side)",
+  "main": "headset_client.js",
+  "scripts": {
+    "cli": "node client_cli.js",
+    "test": "node test_e2e.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
+
